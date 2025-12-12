@@ -1,0 +1,701 @@
+---
+title: "Home Credit Default Risk – EDA"
+author: "Rob Sheehy"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: show
+    df-print: paged
+execute:
+  echo: true
+  warning: false
+  message: false
+freeze: auto
+---
+
+
+```{r}
+# Packages
+library(readr)
+
+# Load all CSVs (assumes they’re in the working directory)
+app_train  <- read_csv("application_train.csv",  show_col_types = FALSE)
+app_test   <- read_csv("application_test.csv",   show_col_types = FALSE)
+bureau     <- read_csv("bureau.csv",             show_col_types = FALSE)
+bureau_bal <- read_csv("bureau_balance.csv",     show_col_types = FALSE)
+prev_app   <- read_csv("previous_application.csv", show_col_types = FALSE)
+inst_pay   <- read_csv("installments_payments.csv", show_col_types = FALSE)
+cc_bal     <- read_csv("credit_card_balance.csv",  show_col_types = FALSE)
+pos_cash   <- read_csv("POS_CASH_balance.csv",     show_col_types = FALSE)
+dict       <- read_csv("HomeCredit_columns_description.csv", show_col_types = FALSE)
+
+```
+
+
+
+# Chunk 1: Load application_train.csv safely and verify TARGET
+
+```{r}
+
+# Packages
+library(readr)
+library(dplyr)
+
+# Read only the train file; make sure TARGET is read as integer (0/1)
+app_train <- read_csv(
+  "application_train.csv",
+  col_types = cols(
+    .default = col_guess(),
+    TARGET   = col_integer()
+  ),
+  show_col_types = FALSE
+)
+
+# Quick sanity checks (these should look right)
+dim(app_train)                                   # rows, cols
+glimpse(app_train[, c("SK_ID_CURR","TARGET")])
+any(is.na(app_train$TARGET))                     # expect FALSE
+unique(app_train$TARGET)                         # expect 0 and 1
+```
+## Notes
+- `TARGET` was read with **no missing values**.
+
+
+# Chunk 2: Target Distribution and Bar Plot
+
+```{r}
+library(ggplot2)
+library(knitr)
+
+# Class counts and percentages
+target_summary <- app_train |>
+  count(TARGET, name = "n") |>
+  mutate(
+    label = ifelse(TARGET == 0, "Repaid", "Default"),
+    percent = round(100 * n / sum(n), 2)
+  ) |>
+  arrange(desc(TARGET))  # to show default and repaid
+
+kable(target_summary, caption = "TARGET distribution (0 = Repaid, 1 = Default)")
+
+# Majority-class baseline accuracy (what a naive classifier would get)
+majority_acc <- max(target_summary$n) / sum(target_summary$n)
+cat("Majority-class baseline accuracy:", round(majority_acc * 100, 2), "%\n")
+
+
+```
+
+## Notes – TARGET check & baseline
+
+- The `TARGET` field is correctly read as 0/1 with **no missing values** after explicitly setting the column type.
+- Class balance is **skewed**:
+  - `Default (1)`: 24,825 cases (**8.07%**)
+  - `Repaid (0)`: 282,686 cases (**91.93%**)
+- A majority class model that predicts **Repaid** for everyone would hit about **91.9% accuracy**.  
+  
+  - **Implications w/ assistance** This tells me plain accuracy is misleading for this problem. I’ll need to favor metrics that reflect performance on the rare class (defaults): ROC-AUC, PR-AUC, recall (TPR) for `TARGET=1`, precision, and F1.
+
+
+# Chunk 3: Compact data dictionary (names + descriptions)
+```{r}
+library(dplyr)
+library(readr)
+library(stringr)
+library(knitr)
+
+dict <- read_csv("HomeCredit_columns_description.csv", show_col_types = FALSE)
+
+dict_clean <-
+  dict %>%
+  transmute(
+    table  = Table,
+    column = Row,
+    desc   = Description
+  )
+
+# Show a sample of column descriptions for application table
+dict_app_train <- dict_clean %>% filter(str_detect(table, "application_(train|test)"))
+knitr::kable(head(dict_app_train, 25),
+             caption = "Sample of column descriptions (application_train/test)")
+```
+
+## AI Usage Log — Semantic Feature Selection
+
+**Prompt:** "You are a credit risk analyst. Using only the column names and descriptions from HomeCredit_columns_description.csv, list 15–20 variables that are most likely to predict default (TARGET=1) at application time. Avoid variables that would leak post-outcome information."
+
+**Brief critique:** Solid focus on income/obligation ratios, personal stability, and prior credit behavior. Will verify these choices and watch for potential redundancy during EDA.
+```{r}
+semantic_candidates <- c(
+  # income / obligation
+  "AMT_INCOME_TOTAL", "AMT_CREDIT", "AMT_ANNUITY", "AMT_GOODS_PRICE",
+  # demographics & stability
+  "DAYS_BIRTH", "DAYS_EMPLOYED", "CNT_CHILDREN", "NAME_FAMILY_STATUS",
+  "NAME_EDUCATION_TYPE", "NAME_INCOME_TYPE",
+  # asset flags
+  "FLAG_OWN_CAR", "FLAG_OWN_REALTY",
+  # region risk proxies
+  "REGION_RATING_CLIENT", "REGION_RATING_CLIENT_W_CITY",
+  # external scores (generic risk proxies supplied by vendor)
+  "EXT_SOURCE_1", "EXT_SOURCE_2", "EXT_SOURCE_3"
+)
+
+# Keep only columns that actually exist in app_train (avoids typos)
+semantic_candidates <- intersect(semantic_candidates, names(app_train))
+semantic_candidates
+```
+
+# Chunk 4 — Quick statistical screen of the semantic candidates
+
+## Prompt:
+
+“Take the features suggested from the semantic list and check which ones are actually 
+most predictive of default in the data. Use quick AUC or correlation checks for each 
+variable and plot them. Keep the code simple and readable.”
+
+```{r}
+library(dplyr)  
+library(yardstick)
+library(ggplot2)
+
+# Helper: safe correlation for numeric x vs binary y
+safe_cor <- function(x, y) {
+  ok <- is.finite(x) & !is.na(y)
+  if (!any(ok)) return(NA_real_)
+  tryCatch(abs(cor(x[ok], y[ok], method = "pearson")), error = function(e) NA_real_)
+}
+
+# Helper: one-variable AUC using logistic regression (works for num or factor)
+one_var_auc <- function(df, y_col, x_col) {
+  d <- df[, c(y_col, x_col)]
+  d <- d[complete.cases(d), , drop = FALSE]
+  if (nrow(d) < 2) return(NA_real_)
+  d[[y_col]] <- as.integer(d[[y_col]])
+  # Binomial GLM; handle factor or numeric automatically
+  f <- as.formula(paste(y_col, "~", x_col))
+  m <- tryCatch(glm(f, data = d, family = binomial()), error = function(e) NULL)
+  if (is.null(m)) return(NA_real_)
+  preds <- predict(m, type = "response")
+  yardstick::roc_auc_vec(truth = factor(d[[y_col]]), estimate = preds, event_level = "second")
+}
+
+# Prepare a compact frame with only needed columns
+use_cols <- unique(c("TARGET", semantic_candidates))
+df <- app_train[, use_cols]
+
+# Compute simple stats per candidate
+stats <- lapply(semantic_candidates, function(v) {
+  x <- df[[v]]
+  if (is.numeric(x)) {
+    tibble::tibble(
+      variable = v,
+      type     = "numeric",
+      cor_abs  = safe_cor(x, df$TARGET),
+      auc      = one_var_auc(df, "TARGET", v)
+    )
+  } else {
+    tibble::tibble(
+      variable = v,
+      type     = "categorical",
+      cor_abs  = NA_real_,
+      auc      = one_var_auc(df, "TARGET", v)
+    )
+  }
+}) %>% dplyr::bind_rows()
+
+# Show the top 12 by AUC
+top_semantic <- stats %>%
+  dplyr::arrange(dplyr::desc(auc)) %>%
+  dplyr::slice_head(n = 12)
+
+knitr::kable(top_semantic, digits = 3,
+             caption = "Semantic candidates ranked by simple one-variable AUC")
+
+# Simple plot
+p <- ggplot(top_semantic, aes(x = reorder(variable, auc), y = auc)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "One-variable AUC for semantic candidates",
+       x = "Variable", y = "AUC") +
+  theme_minimal()
+
+print(p)
+```
+
+## Notes — Semantic Variable Check
+- The external source scores (EXT_SOURCE_1–3) clearly have the strongest predictive power, with AUCs around 0.66–0.68.
+- DAYS_BIRTH also shows a signal suggesting that maybe older applicants tend to default less often.
+- The income, education, and regional rating features show slight correlation but are kept for interactions or combined modeling.
+- Overall, these results confirm that our initial semantic picks have strong signal, especially the external risk scores and basic demographic variables.
+
+
+
+# Chunk 5: Missing Data Analysis
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+
+# Calculate % missing for each column
+missing_summary <- app_train %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "n_missing") %>%
+  mutate(pct_missing = round(100 * n_missing / nrow(app_train), 2)) %>%
+  arrange(desc(pct_missing))
+
+# Show top 15 variables with most missingness
+kable(head(missing_summary, 15),
+      caption = "Variables with most missing data")
+
+# Simple bar plot - show only top 15 to keep it readable
+top_missing <- missing_summary %>% 
+  filter(pct_missing > 5) %>%
+  slice_head(n = 15)
+
+p_missing <- ggplot(top_missing, aes(x = reorder(variable, pct_missing), y = pct_missing)) +
+  geom_col(fill = "#CD5C5C") +
+  coord_flip() +
+  labs(
+    title = "Top 15 Variables with Missing Data",
+    x = NULL,
+    y = "% Missing"
+  ) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8))
+
+print(p_missing)
+
+# Summary stats
+cat("\nVariables with >50% missing:", sum(missing_summary$pct_missing > 50), "\n")
+cat("Variables with 0% missing:", sum(missing_summary$pct_missing == 0), "\n\n")
+```
+
+## Notes — Missing Data Analysis
+
+**AI Prompt Used:**  
+"Show me which variables in application_train have the most missing data. Assist with creation of table and bar plot."
+
+**Key Findings:**
+- 41 variables have >50% missing. This appears to consist of mostly building/apartment characteristics (67-70% missing). These are top candidates to drop.
+- The key semantic candidates (EXT_SOURCE_1-3, DAYS_BIRTH, AMT_INCOME_TOTAL) don't appear in the high-missingness list which is good news.
+- 58 variables are complete with 0% missing, including TARGET
+
+
+# Chunk 6: Feature Distributions by TARGET
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Select top predictive features from Chunk 4 to visualize
+top_features <- c("EXT_SOURCE_3", "EXT_SOURCE_2", "EXT_SOURCE_1", 
+                  "DAYS_BIRTH", "DAYS_EMPLOYED", "AMT_CREDIT")
+
+# Create a long-format data for easier plotting
+plot_data <- app_train %>%
+  select(TARGET, all_of(top_features)) %>%
+  mutate(TARGET = factor(TARGET, levels = c(0, 1), labels = c("Repaid", "Default"))) %>%
+  pivot_longer(cols = -TARGET, names_to = "variable", values_to = "value")
+
+# Box plots comparing distributions
+p_dist <- ggplot(plot_data, aes(x = TARGET, y = value, fill = TARGET)) +
+  geom_boxplot(outlier.alpha = 0.2, outlier.size = 0.5) +
+  facet_wrap(~variable, scales = "free_y", ncol = 3) +
+  scale_fill_manual(values = c("Repaid" = "#2E8B57", "Default" = "#CD5C5C")) +
+  labs(
+    title = "Feature Distributions: Repaid vs Default",
+    x = NULL,
+    y = "Value"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_dist)
+
+# Density plots for the top 3 external sources
+ext_source_data <- app_train %>%
+  select(TARGET, EXT_SOURCE_1, EXT_SOURCE_2, EXT_SOURCE_3) %>%
+  mutate(TARGET = factor(TARGET, levels = c(0, 1), labels = c("Repaid", "Default"))) %>%
+  pivot_longer(cols = starts_with("EXT"), names_to = "source", values_to = "score")
+
+p_density <- ggplot(ext_source_data, aes(x = score, fill = TARGET)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~source, ncol = 1) +
+  scale_fill_manual(values = c("Repaid" = "#2E8B57", "Default" = "#CD5C5C")) +
+  labs(
+    title = "External Source Score Distributions by Default Status",
+    x = "Score",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_density)
+```
+
+## Notes — Distributions by TARGET
+
+**AI Prompt Used:**  
+"Create box plots and density plots comparing the distributions of the top predictive features between defaulters and non-defaulters."
+
+**Key Findings:**
+- EXT_SOURCE scores show clear separation. Defaulters consistently have lower scores across all three sources as seen in both plots
+- DAYS_EMPLOYED has major outliers. that need investigation - those extreme values are likely data errors or special codes
+- Despite some separation, substantial overlap exists between groups - will need multiple features combined for strong predictions
+
+**Implications w/ assistance**
+- The features with clear separation between TARGET groups will be strong predictors
+- Heavy overlap suggests we'll need multiple features combined to predict well
+
+
+
+# Chunk 7: Categorical Variable Exploration
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(knitr)
+
+# Select key categorical variables from semantic candidates
+cat_vars <- c("NAME_EDUCATION_TYPE", "NAME_INCOME_TYPE", "NAME_FAMILY_STATUS")
+
+# Function to summarize default rates by category
+summarize_categorical <- function(data, var_name) {
+  data %>%
+    group_by(category = .data[[var_name]]) %>%
+    summarise(
+      n = n(),
+      n_default = sum(TARGET),
+      default_rate = round(100 * mean(TARGET), 2)
+    ) %>%
+    arrange(desc(default_rate)) %>%
+    mutate(variable = var_name)
+}
+
+# Get summaries for all categorical variables
+cat_summaries <- lapply(cat_vars, function(v) {
+  summarize_categorical(app_train, v)
+}) %>% bind_rows()
+
+# Display tables
+for (var in cat_vars) {
+  cat("\n")
+  print(kable(cat_summaries %>% filter(variable == var) %>% select(-variable),
+              caption = paste("Default rates by", var)))
+  cat("\n")
+}
+
+# Visualize default rates for education
+education_plot <- app_train %>%
+  group_by(NAME_EDUCATION_TYPE) %>%
+  summarise(
+    n = n(),
+    default_rate = 100 * mean(TARGET)
+  ) %>%
+  filter(!is.na(NAME_EDUCATION_TYPE))
+
+p_default_education <- ggplot(education_plot, aes(x = reorder(NAME_EDUCATION_TYPE, default_rate), 
+                            y = default_rate)) +
+  geom_col(fill = "#4682B4") +
+  geom_text(aes(label = paste0(round(default_rate, 1), "%")), 
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  labs(
+    title = "Default Rate by Education Level",
+    x = NULL,
+    y = "Default Rate (%)"
+  ) +
+  theme_minimal()
+
+print(p_default_education)
+
+# Visualize default rates for income type
+income_plot <- app_train %>%
+  group_by(NAME_INCOME_TYPE) %>%
+  summarise(
+    n = n(),
+    default_rate = 100 * mean(TARGET)
+  ) %>%
+  filter(!is.na(NAME_INCOME_TYPE))
+
+p_default_income <- ggplot(income_plot, aes(x = reorder(NAME_INCOME_TYPE, default_rate), 
+                         y = default_rate)) +
+  geom_col(fill = "#4682B4") +
+  geom_text(aes(label = paste0(round(default_rate, 1), "%")), 
+            hjust = -0.1, size = 3) +
+  coord_flip() +
+  labs(
+    title = "Default Rate by Income Type",
+    x = NULL,
+    y = "Default Rate (%)"
+  ) +
+  theme_minimal()
+
+print(p_default_income)
+```
+
+## Notes — Categorical Variables
+
+**AI Prompt:** "Analyze categorical variables like education, income tpye, and family status. Show default rates for each category and identify which groups have higher risk."
+
+**Key Findings:**
+- The lower the education level, the greater the risk generally: Lower secondary has highest default rate (10.9%), while academic degree has lowest (1.8%). Higher education matters for creditworthiness.
+- Income type reveals high-risk groups: Maternity leave (40%) and unemployed (36.4%) have extremely high default rates, but very small sample sizes at just 5 and 22. Working and pensioners are lower risk (6-10%).
+- Family status shows minimal variation: All categories cluster between 7-10% default rate, suggesting this won't be a strong standalone predictor.
+
+**Implications:**
+- Education level will be a useful predictor in models
+- Income type categories with tiny samples (maternity leave n=5, student n=18, businessman n=10) should be combined with similar groups. The data has so few unemployed customers in the system, so that will need to be addressed in future modeling or customer bases. 
+
+
+
+# Chunk 8: Feature Engineering
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(yardstick)
+
+# Create derived features that might capture important relationships
+app_train_fe <- app_train %>%
+  mutate(
+    # Convert days to years (more interpretable)
+    AGE_YEARS = -DAYS_BIRTH / 365,
+    EMPLOYMENT_YEARS = -DAYS_EMPLOYED / 365,
+    
+    # Financial ratios
+    CREDIT_INCOME_RATIO = AMT_CREDIT / AMT_INCOME_TOTAL,
+    ANNUITY_INCOME_RATIO = AMT_ANNUITY / AMT_INCOME_TOTAL,
+    CREDIT_GOODS_RATIO = AMT_CREDIT / AMT_GOODS_PRICE,
+    
+    # Payment burden
+    INCOME_PER_PERSON = AMT_INCOME_TOTAL / (1 + CNT_FAM_MEMBERS)
+  )
+
+# Select engineered features to evaluate
+engineered_features <- c("AGE_YEARS", "EMPLOYMENT_YEARS", "CREDIT_INCOME_RATIO",
+                         "ANNUITY_INCOME_RATIO", "CREDIT_GOODS_RATIO", "INCOME_PER_PERSON")
+
+# Calculate AUC for each engineered feature (reuse function from Chunk 4)
+one_var_auc <- function(df, y_col, x_col) {
+  d <- df[, c(y_col, x_col)]
+  d <- d[complete.cases(d), , drop = FALSE]
+  if (nrow(d) < 2) return(NA_real_)
+  d[[y_col]] <- as.integer(d[[y_col]])
+  f <- as.formula(paste(y_col, "~", x_col))
+  m <- tryCatch(glm(f, data = d, family = binomial()), error = function(e) NULL)
+  if (is.null(m)) return(NA_real_)
+  preds <- predict(m, type = "response")
+  yardstick::roc_auc_vec(truth = factor(d[[y_col]]), estimate = preds, event_level = "second")
+}
+
+# Evaluate engineered features
+fe_performance <- data.frame(
+  feature = engineered_features,
+  auc = sapply(engineered_features, function(f) {
+    one_var_auc(app_train_fe, "TARGET", f)
+  })
+) %>%
+  arrange(desc(auc))
+
+knitr::kable(fe_performance, digits = 3,
+             caption = "Engineered features ranked by AUC")
+
+# Visualize the best engineered feature
+best_feature <- fe_performance$feature[1]
+
+p_best_feature <- ggplot(app_train_fe, aes(x = factor(TARGET, labels = c("Repaid", "Default")), 
+                          y = .data[[best_feature]])) +
+  geom_boxplot(aes(fill = factor(TARGET)), outlier.alpha = 0.2, outlier.size = 0.5) +
+  scale_fill_manual(values = c("0" = "#2E8B57", "1" = "#CD5C5C")) +
+  labs(
+    title = paste("Distribution of", best_feature, "by Default Status"),
+    x = NULL,
+    y = best_feature
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+print(p_best_feature)
+```
+
+## Notes — Feature Engineering
+
+**AI Prompt:** "Create some new variables by combining existing ones in ways that might make more sense for predicting defaults. For example, turn negative day counts into actual ages, and calculate ratios like credit-to-income."
+
+**Key Findings:**
+- AGE_YEARS performs is the best with AUC = 0.583, confirming younger applicants are higher risk. Defaulters median age ~40 vs ~44 for repaid group.
+- Some financial ratios show moderate predictive power: CREDIT_GOODS_RATIO (0.569), ANNUITY_INCOME_RATIO (0.520), and CREDIT_INCOME_RATIO (0.502) all capture some signal about payment burden.
+- EMPLOYMENT_YEARS is the weakest (AUC = 0.473), likely due to quality issues noted in Chunk 6.
+- These engineered features don't outperform EXT_SOURCE variables (0.66-0.68 from Chunk 4), but could add value when combined in a model.
+
+**Implications w/ assistance:**
+- Include AGE_YEARS and financial ratios in final model alongside EXT_SOURCE scores
+- Ratios capture relative financial stress better than raw amounts alone
+
+
+
+# Chunk 9: Bureau Data Join and Exploration
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(yardstick)
+library(knitr)
+
+# Aggregate bureau data to application level (one row per SK_ID_CURR)
+bureau_agg <- bureau %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    # Count of previous credits
+    BUREAU_CREDIT_COUNT = n(),
+    
+    # Average days credit (how old are their credit accounts)
+    BUREAU_AVG_DAYS_CREDIT = mean(DAYS_CREDIT, na.rm = TRUE),
+    
+    # Count of active credits
+    BUREAU_ACTIVE_COUNT = sum(CREDIT_ACTIVE == "Active", na.rm = TRUE),
+    
+    # Count of closed credits
+    BUREAU_CLOSED_COUNT = sum(CREDIT_ACTIVE == "Closed", na.rm = TRUE),
+    
+    # Average credit amount
+    BUREAU_AVG_CREDIT_AMT = mean(AMT_CREDIT_SUM, na.rm = TRUE),
+    
+    # Total debt across all credits
+    BUREAU_TOTAL_DEBT = sum(AMT_CREDIT_SUM_DEBT, na.rm = TRUE),
+    
+    # Count of credits with past due
+    BUREAU_PASTDUE_COUNT = sum(CREDIT_DAY_OVERDUE > 0, na.rm = TRUE)
+  )
+
+# Join with application_train
+app_with_bureau <- app_train %>%
+  left_join(bureau_agg, by = "SK_ID_CURR")
+
+# Check how many applicants have bureau history
+cat("Applicants with bureau history:", 
+    sum(!is.na(app_with_bureau$BUREAU_CREDIT_COUNT)), 
+    "out of", nrow(app_with_bureau), "\n\n")
+
+# For those without bureau history, fill with 0s (they have no previous credits)
+app_with_bureau <- app_with_bureau %>%
+  mutate(across(starts_with("BUREAU_"), ~replace_na(., 0)))
+
+# Select bureau features to evaluate
+bureau_features <- c("BUREAU_CREDIT_COUNT", "BUREAU_AVG_DAYS_CREDIT", 
+                     "BUREAU_ACTIVE_COUNT", "BUREAU_TOTAL_DEBT", 
+                     "BUREAU_PASTDUE_COUNT")
+
+# Calculate AUC for bureau features
+one_var_auc <- function(df, y_col, x_col) {
+  d <- df[, c(y_col, x_col)]
+  d <- d[complete.cases(d), , drop = FALSE]
+  if (nrow(d) < 2) return(NA_real_)
+  d[[y_col]] <- as.integer(d[[y_col]])
+  f <- as.formula(paste(y_col, "~", x_col))
+  m <- tryCatch(glm(f, data = d, family = binomial()), error = function(e) NULL)
+  if (is.null(m)) return(NA_real_)
+  preds <- predict(m, type = "response")
+  yardstick::roc_auc_vec(truth = factor(d[[y_col]]), estimate = preds, event_level = "second")
+}
+
+bureau_performance <- data.frame(
+  feature = bureau_features,
+  auc = sapply(bureau_features, function(f) {
+    one_var_auc(app_with_bureau, "TARGET", f)
+  })
+) %>%
+  arrange(desc(auc))
+
+kable(bureau_performance, digits = 3,
+      caption = "Bureau features ranked by AUC")
+
+# Visualize relationship between bureau credit count and default
+bureau_summary <- app_with_bureau %>%
+  mutate(
+    CREDIT_BUCKET = cut(BUREAU_CREDIT_COUNT, 
+                        breaks = c(-1, 0, 2, 5, 10, 100),
+                        labels = c("0 (No history)", "1-2", "3-5", "6-10", "10+"))
+  ) %>%
+  group_by(CREDIT_BUCKET) %>%
+  summarise(
+    n = n(),
+    default_rate = 100 * mean(TARGET)
+  )
+
+  p_bureau_default <- ggplot(bureau_summary, aes(x = CREDIT_BUCKET, y = default_rate)) +
+  geom_col(fill = "#4682B4") +
+  geom_text(aes(label = paste0(round(default_rate, 1), "%")), 
+            vjust = -0.5, size = 3) +
+  labs(
+    title = "Default Rate by Number of Previous Credits (Bureau)",
+    x = "Number of Previous Credits",
+    y = "Default Rate (%)"
+  ) +
+  theme_minimal()
+
+print(p_bureau_default)
+```
+
+## Notes — Bureau Data Join
+
+**Summarized Result of AI Prompts:** "Help me join the bureau credit history data with the application data. Aggregate the bureau table so there's one row per applicant with summary statistics like number of previous credits, average debt, and past due counts."
+
+**Key Findings:**
+- 86% of applicants have bureau history (263,491 out of 307,511), meaning most have prior credit experience
+- BUREAU_AVG_DAYS_CREDIT is the strongest predictor (AUC = 0.592), followed by BUREAU_ACTIVE_COUNT (0.529) and BUREAU_TOTAL_DEBT (0.528)
+- U-shaped pattern: Applicants with no bureau history have highest default rate (10.1%), those with 3-10 previous credits are lowest risk (~7.4%), and those with 10+ credits increase slightly (8.2%)
+- All bureau features show moderate predictive power 0.50-0.59 AUC range
+
+**Implications:**
+- Bureau credit history adds useful signal beyond application data alone
+- Average days credit matters more than count of credits
+
+
+
+# Results
+
+## Summary of EDA Findings
+
+**Key Data Problems Discovered:**
+
+- The target is heavily imbalanced  with only 8% defaults, we can't rely on accuracy alone.
+- There are 41 variables have over 50% missing data - mostly building/apartment characteristics we'll likely need to drop
+- DAYS_EMPLOYED has outliers that need investigation or to drop before modeling
+- Some categorical groups especially in income type are too small and will need to be combined. Unemployed, Maternal leave, student. The data is not representative of a broader income type population. 
+
+**Strongest Predictive Relationships:**
+
+1. **External credit scores (EXT_SOURCE_1, 2, 3)** are  the strongest predictors
+   - These vendor risk scores show defaulters consistently score lower
+   - AUC values around 0.66-0.68, far better than other individual features
+   
+2. **Age shows meaningful separation** - younger applicants default more often
+   - Median age of defaulters is about 40 vs 44 for repaid loans
+   
+3. **Education has a clear risk gradient**
+   - Lower secondary education: 10.9% default rate
+   - Academic degree: 1.8% default rate
+   
+4. **Income/employment type matters**
+   - Maternity leave and unemployed show very high default rates (though small samples)
+   - Regular working people and pensioners are lower risk (~6-10% default)
+
+5. **Bureau credit history adds signal**
+   - Applicants with 3-10 previous credits have lowest default rates  at ~7.4%
+   - No credit history or many credits (10+) show slightly higher risk
+
+**How This EDA Influenced Analytics Approach:**
+
+- We'll prioritize EXT_SOURCE variables and demographic features such as age and education as core predictors
+- Financial ratios (credit-to-income, annuity-to-income) should be used to better capture payment stress
+- Bureau features will be included for additional context about credit behavior
+- We need to handle class imbalance carefully - using stratified splits and focusing on ROC-AUC and precision-recall metrics instead of plain accuracy
+- Data cleaning is critical before modeling: drop high-missingness variables, fix DAYS_EMPLOYED anomalies, and combine small categories
+- The strong signal from multiple features gives us confidence that a good model is achievable
+
+The data has some noticeable predictive power - several variables show clear differences between defaulters and non-defaulters, which means we can likely build something useful for Home Credit's lending decisions.

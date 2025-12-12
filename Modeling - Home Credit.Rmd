@@ -1,0 +1,180 @@
+---
+title: "Home Credit Default Risk — Modeling"
+author: "Rob Sheehy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: show
+    df_print: paged
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Introduction
+
+This notebook builds predictive models for the Home Credit Default Risk project. Based on the EDA findings, we focus on logistic regression models and explore handling the class imbalance issue.
+
+# Load Data
+```{r}
+library(dplyr)
+library(readr)
+
+# Load the original application_train.csv instead
+train_data <- read_csv("application_train.csv", show_col_types = FALSE)
+
+cat("Data dimensions:", nrow(train_data), "rows,", ncol(train_data), "columns\n\n")
+
+# Check TARGET exists
+cat("TARGET column check:\n")
+print(table(train_data$TARGET))
+cat("Default rate:", round(100 * mean(train_data$TARGET), 2), "%\n\n")
+
+# Select key features for modeling
+train_clean <- train_data %>%
+  select(TARGET, 
+         EXT_SOURCE_1, EXT_SOURCE_2, EXT_SOURCE_3,
+         AMT_CREDIT, AMT_INCOME_TOTAL, AMT_ANNUITY,
+         DAYS_BIRTH, DAYS_EMPLOYED) %>%
+  mutate(
+    AGE_YEARS = abs(DAYS_BIRTH) / 365,
+    CREDIT_INCOME_RATIO = AMT_CREDIT / AMT_INCOME_TOTAL,
+    ANNUITY_INCOME_RATIO = AMT_ANNUITY / AMT_INCOME_TOTAL
+  ) %>%
+  select(-DAYS_BIRTH, -DAYS_EMPLOYED, -AMT_CREDIT, -AMT_INCOME_TOTAL, -AMT_ANNUITY) %>%
+  na.omit()
+
+cat("After cleaning and feature engineering:", nrow(train_clean), "observations\n")
+cat("Features:", ncol(train_clean) - 1, "\n")
+```
+
+# Train/Validation Split
+```{r}
+library(caret)
+
+set.seed(42)
+
+# Create 80/20 split
+train_index <- createDataPartition(train_clean$TARGET, p = 0.8, list = FALSE)
+
+train_set <- train_clean[train_index, ]
+valid_set <- train_clean[-train_index, ]
+
+cat("Training set:", nrow(train_set), "observations\n")
+cat("Training default rate:", round(100 * mean(train_set$TARGET), 2), "%\n\n")
+
+cat("Validation set:", nrow(valid_set), "observations\n")
+cat("Validation default rate:", round(100 * mean(valid_set$TARGET), 2), "%\n")
+```
+
+# Baseline Logistic Regression
+```{r}
+library(yardstick)
+library(pROC)
+
+# Fit baseline model
+baseline_model <- glm(TARGET ~ ., 
+                     data = train_set, 
+                     family = binomial())
+
+# Get predictions
+train_pred <- predict(baseline_model, type = "response")
+valid_pred <- predict(baseline_model, newdata = valid_set, type = "response")
+
+# Calculate AUC
+train_auc <- roc_auc_vec(truth = factor(train_set$TARGET), 
+                         estimate = train_pred, 
+                         event_level = "second")
+
+valid_auc <- roc_auc_vec(truth = factor(valid_set$TARGET), 
+                         estimate = valid_pred, 
+                         event_level = "second")
+
+cat("Baseline Logistic Regression:\n")
+cat("Training AUC:", round(train_auc, 4), "\n")
+cat("Validation AUC:", round(valid_auc, 4), "\n\n")
+
+# Feature importance
+coef_df <- data.frame(
+  feature = names(coef(baseline_model))[-1],
+  coefficient = coef(baseline_model)[-1]
+) %>%
+  arrange(desc(abs(coefficient)))
+
+knitr::kable(head(coef_df, 10), digits = 4, 
+             caption = "Top 10 Feature Coefficients")
+
+# ROC Curve
+roc_obj <- roc(valid_set$TARGET, valid_pred, quiet = TRUE)
+plot(roc_obj, main = "ROC Curve - Baseline Model",
+     col = "#4682B4", lwd = 2)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+text(0.6, 0.2, paste("AUC =", round(valid_auc, 3)), cex = 1.2)
+```
+
+# Weighted Logistic Regression
+```{r}
+# Calculate class weights to handle imbalance
+class_weights <- 1 / table(train_set$TARGET)
+weights <- ifelse(train_set$TARGET == 1, 
+                  class_weights["1"], 
+                  class_weights["0"])
+weights <- weights * nrow(train_set) / sum(weights)
+
+# Fit weighted model
+weighted_model <- glm(TARGET ~ .,
+                     data = train_set,
+                     family = binomial(),
+                     weights = weights)
+
+# Get predictions
+train_pred_w <- predict(weighted_model, type = "response")
+valid_pred_w <- predict(weighted_model, newdata = valid_set, type = "response")
+
+# Calculate AUC
+train_auc_w <- roc_auc_vec(truth = factor(train_set$TARGET),
+                           estimate = train_pred_w,
+                           event_level = "second")
+
+valid_auc_w <- roc_auc_vec(truth = factor(valid_set$TARGET),
+                           estimate = valid_pred_w,
+                           event_level = "second")
+
+cat("Weighted Logistic Regression:\n")
+cat("Training AUC:", round(train_auc_w, 4), "\n")
+cat("Validation AUC:", round(valid_auc_w, 4), "\n\n")
+
+cat("Improvement over baseline:", 
+    round((valid_auc_w - valid_auc) * 100, 2), "percentage points\n")
+```
+
+# Model Comparison
+```{r}
+# Compare ROC curves
+roc_baseline <- roc(valid_set$TARGET, valid_pred, quiet = TRUE)
+roc_weighted <- roc(valid_set$TARGET, valid_pred_w, quiet = TRUE)
+
+plot(roc_baseline, col = "#4682B4", lwd = 2, main = "Model Comparison")
+plot(roc_weighted, col = "#CD5C5C", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+legend("bottomright", 
+       legend = c(paste("Baseline AUC =", round(valid_auc, 3)),
+                  paste("Weighted AUC =", round(valid_auc_w, 3))),
+       col = c("#4682B4", "#CD5C5C"), 
+       lwd = 2)
+
+# Summary table
+results <- data.frame(
+  Model = c("Baseline Logistic", "Weighted Logistic"),
+  Train_AUC = c(train_auc, train_auc_w),
+  Valid_AUC = c(valid_auc, valid_auc_w)
+)
+
+knitr::kable(results, digits = 4, caption = "Model Performance Summary")
+```
+
+# Summary
+
+THe Logistic regression models demonstrate solid predictive performance on this imbalanced dataset. The baseline model achieves reasonable AUC scores using key features identified in exploratory analysis. The weighted approach attempts to address class imbalance by adjusting for the 8% default rate. EXT_SOURCE variables emerge as the most important predictors, consistent with domain knowledge about credit risk. Future work could explore additional feature engineering, threshold optimization for business objectives, and comparison with tree-based ensemble methods.
