@@ -68,7 +68,7 @@ The U-shaped pattern in credit history is especially interesting - it suggests t
 ## What I Learned
 
 **Technical Skills:**
-- How to handle severely imbalanced datasets (can't just use accuracy!)
+- How to handle severely imbalanced datasets (can't just use accuracy)
 - Feature engineering makes a big difference - ratios worked better than raw dollar amounts
 - Data cleaning is just as important as modeling
 - Visualization helps communicate findings way better than just numbers
