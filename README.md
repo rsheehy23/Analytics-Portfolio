@@ -71,7 +71,7 @@ The U-shaped pattern in credit history is especially interesting - it suggests t
 - How to handle severely imbalanced datasets (can't just use accuracy)
 - Feature engineering makes a big difference - ratios worked better than raw dollar amounts
 - Data cleaning is just as important as modeling
-- Visualization helps communicate findings way better than just numbers
+- Re-iterated that visualization helps communicate findings way better than just numbers
 
 **Tools I Used:**
 - R and RStudio for all the analysis
@@ -81,7 +81,7 @@ The U-shaped pattern in credit history is especially interesting - it suggests t
 - Git and GitHub for version control
 
 **Biggest Takeaways:**
-- Domain knowledge matters - those external credit scores were gold
+- Domain knowledge matters - those external credit scores were very helpful
 - When your data is imbalanced, you need different metrics like AUC instead of accuracy
 - Sometimes simpler models (logistic regression) are better than complex ones when you need to explain your decisions
 
